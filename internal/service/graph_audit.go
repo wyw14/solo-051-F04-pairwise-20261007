@@ -25,8 +25,8 @@ func ExerciseProductionGraph(ctx context.Context, svc *Service, runtime *Runtime
 	coordinator := &run.LayerCoordinator{Source: source.NewController(10)}
 	result["completed_layers"] = coordinator.Completed()
 	broadcast := optical.NewBroadcaster()
-	subscription, _ := broadcast.Subscribe(1)
-	broadcast.Unsubscribe(subscription)
+	subscription := broadcast.Subscribe(1)
+	subscription.Unsubscribe()
 	result["window_values"] = len(runtime.Window.Values())
 	result["monitor_samples"] = len(runtime.Monitor.Samples())
 	result["monitor_estimate"] = runtime.Monitor.Estimate(10, 0.9).Nanometers

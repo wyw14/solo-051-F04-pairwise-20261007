@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/wyw14/cry-161/internal/interlock"
 	"github.com/wyw14/cry-161/internal/journal"
@@ -30,6 +31,7 @@ type Runtime struct {
 	InterlockAudit  *interlock.Audit
 	Shutter         *shutter.Controller
 	Sequence        int64
+	sampleSeq       int64
 	StartedAt       time.Time
 }
 
@@ -47,12 +49,66 @@ func (r *Runtime) NextSequence() int64 {
 	return value
 }
 
+// NextSampleSequence hands out the monotonic sequence carried by every
+// thickness sample on both the live channel and the replay trace.
+func (r *Runtime) NextSampleSequence() int64 {
+	r.mu.Lock()
+	r.sampleSeq++
+	value := r.sampleSeq
+	r.mu.Unlock()
+	return value
+}
+
+// traceReplay adapts the trace store to optical.ReplayReader. An expired
+// cursor is wrapped so it matches both journal.ErrCursorExpired and
+// optical.ErrGapExpired.
+type traceReplay struct{ traces *journal.TraceStore }
+
+func (t traceReplay) ReplayAfter(ctx context.Context, cursor optical.Cursor, limit int) ([]model.ThicknessSample, error) {
+	samples, err := t.traces.ReplayAfter(ctx, cursor.Seq, limit)
+	if err != nil {
+		if errors.Is(err, journal.ErrCursorExpired) {
+			return nil, fmt.Errorf("%w: %w", optical.ErrGapExpired, err)
+		}
+		return nil, err
+	}
+	return samples, nil
+}
+
+// NewConsumer attaches an optical consumer to the runtime broadcaster. Gap
+// replay is served from the trace store; replayed samples reach the
+// consumer's event channel only and never re-enter the safety Monitor.
+func (r *Runtime) NewConsumer(monitor *optical.Monitor, options optical.ConsumerOptions) *optical.Consumer {
+	if options.Replay == nil {
+		options.Replay = traceReplay{traces: r.Traces}
+	}
+	return optical.NewConsumer(r.Broadcast, monitor, options)
+}
+
+// Replay returns trace samples strictly after cursor without touching any
+// live subscription or monitor.
+func (r *Runtime) Replay(ctx context.Context, cursor optical.Cursor, limit int) (optical.ReplayReport, error) {
+	return optical.ReplayGap(ctx, traceReplay{traces: r.Traces}, cursor, limit)
+}
+
 func (r *Runtime) Capture(sample model.ThicknessSample, layer int) (model.LayerEvidence, error) {
 	if sample.At.IsZero() {
 		sample.At = time.Now().UTC()
 	}
+	if sample.Seq == 0 {
+		sample.Seq = r.NextSampleSequence()
+	} else {
+		// Honour caller-supplied sequences while keeping the counter ahead.
+		r.mu.Lock()
+		if sample.Seq > r.sampleSeq {
+			r.sampleSeq = sample.Seq
+		}
+		r.mu.Unlock()
+	}
 	r.Monitor.Add(sample)
 	r.Window.Add(sample)
+	// Persist before publishing: a consumer dropping an older live sample
+	// must be able to fill the gap from the trace immediately.
 	r.Traces.AppendThickness(sample)
 	_ = r.Broadcast.PublishThen(sample, nil)
 	evidence := model.BuildLayerEvidence(sample, layer)

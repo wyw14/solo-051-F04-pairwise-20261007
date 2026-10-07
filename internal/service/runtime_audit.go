@@ -87,20 +87,26 @@ func (s *Service) Audit(ctx context.Context, runtime *Runtime) AuditReport {
 	block := <-blocks
 	runtime.RecordFrequency(model.NewID(), block)
 	monitor := optical.NewMonitor()
-	samples := make(chan model.ThicknessSample, 2)
-	consumer := optical.NewConsumer(monitor, samples)
+	broadcaster := optical.NewBroadcaster()
+	consumer := optical.NewConsumer(broadcaster, monitor, optical.ConsumerOptions{
+		Buffer:         2,
+		ReplayInterval: time.Millisecond,
+	})
 	stop := make(chan struct{})
 	go consumer.Run(stop)
+	broadcaster.Publish(model.ThicknessSample{RunID: model.NewID(), Seq: 1, Frequency: 10, Transmission: 0.9, Nanometers: 5, Valid: true, At: time.Now().UTC()})
+	_, observed := consumer.WaitForSample(20 * time.Millisecond)
+	// Rotating the transport returns the cursor from which the gap must be
+	// filled on reconnect.
 	reconnect := optical.DefaultReconnectPolicy()
-	channel, reconnectErr := reconnect.Connect(ctx, consumer)
+	cursor, reconnectErr := reconnect.Connect(ctx, consumer)
 	if reconnectErr != nil {
 		report.Passed = false
 		report.Checks["optical_reconnect"] = reconnectErr.Error()
 	} else {
-		channel <- model.ThicknessSample{RunID: model.NewID(), Frequency: 10, Transmission: 0.9, Nanometers: 5, Valid: true, At: time.Now().UTC()}
-		_, observed := consumer.WaitForSample(20 * time.Millisecond)
-		report.Checks["optical_reconnect"] = fmt.Sprintf("observed=%t reconnects=%d", observed, consumer.ReconnectCount())
+		report.Checks["optical_reconnect"] = fmt.Sprintf("observed=%t reconnects=%d cursor=%d", observed, consumer.ReconnectCount(), cursor.Seq)
 	}
+	consumer.Close()
 	close(stop)
 	carrier := substrate.NewCarrier()
 	carrierRun := model.NewID()
