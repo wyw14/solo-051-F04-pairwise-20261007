@@ -51,10 +51,15 @@ func (r *Runtime) Capture(sample model.ThicknessSample, layer int) (model.LayerE
 	if sample.At.IsZero() {
 		sample.At = time.Now().UTC()
 	}
+	// The trace owns the sequence: number the sample in the log first so every
+	// downstream copy (monitor, broadcast) carries the same seq and a
+	// reconnect cursor can always resolve its gap from the trace.
+	sample.Seq = r.Traces.AppendThickness(sample)
 	r.Monitor.Add(sample)
 	r.Window.Add(sample)
-	r.Traces.AppendThickness(sample)
-	_ = r.Broadcast.PublishThen(sample, nil)
+	// Non-blocking fan-out: a slow subscriber drops and later replays; the
+	// safety-control path (monitor/evidence above) is never held behind it.
+	r.Broadcast.Publish(sample)
 	evidence := model.BuildLayerEvidence(sample, layer)
 	if err := evidence.Validate(); err != nil {
 		r.Incidents.Raise(sample.RunID, "warning", err.Error())

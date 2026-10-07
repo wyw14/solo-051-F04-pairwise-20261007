@@ -54,6 +54,7 @@ type ChamberSnapshot struct {
 
 type ThicknessSample struct {
 	RunID        ID        `json:"run_id"`
+	Seq          int64     `json:"seq"`
 	Frequency    float64   `json:"frequency"`
 	Transmission float64   `json:"transmission"`
 	Nanometers   float64   `json:"nanometers"`

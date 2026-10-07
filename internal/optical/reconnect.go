@@ -16,30 +16,38 @@ func DefaultReconnectPolicy() ReconnectPolicy {
 	return ReconnectPolicy{Attempts: 3, Backoff: time.Millisecond}
 }
 
-func (p ReconnectPolicy) Connect(ctx context.Context, consumer *Consumer) (chan model.ThicknessSample, error) {
+// ReconnectResult carries the fresh live channel and the cursor that locates
+// the gap in the trace: call ReplayAfter(cursor.LastSeq) (or
+// Consumer.ReplayGap) to recover everything missed while disconnected.
+type ReconnectResult struct {
+	Channel chan model.ThicknessSample
+	Cursor  Cursor
+}
+
+func (p ReconnectPolicy) Connect(ctx context.Context, consumer *Consumer) (ReconnectResult, error) {
 	if consumer == nil {
-		return nil, fmt.Errorf("consumer is required")
+		return ReconnectResult{}, fmt.Errorf("consumer is required")
 	}
 	if p.Attempts < 1 || p.Backoff < 0 {
-		return nil, fmt.Errorf("reconnect policy is invalid")
+		return ReconnectResult{}, fmt.Errorf("reconnect policy is invalid")
 	}
 	for attempt := 0; attempt < p.Attempts; attempt++ {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ReconnectResult{}, ctx.Err()
 		default:
 		}
-		channel := consumer.Reconnect()
+		channel, cursor := consumer.Reconnect()
 		if channel != nil {
-			return channel, nil
+			return ReconnectResult{Channel: channel, Cursor: cursor}, nil
 		}
 		timer := time.NewTimer(p.Backoff)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			return ReconnectResult{}, ctx.Err()
 		case <-timer.C:
 		}
 	}
-	return nil, fmt.Errorf("optical reconnect exhausted")
+	return ReconnectResult{}, fmt.Errorf("optical reconnect exhausted")
 }

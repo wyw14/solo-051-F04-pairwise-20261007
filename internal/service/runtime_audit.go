@@ -92,16 +92,71 @@ func (s *Service) Audit(ctx context.Context, runtime *Runtime) AuditReport {
 	stop := make(chan struct{})
 	go consumer.Run(stop)
 	reconnect := optical.DefaultReconnectPolicy()
-	channel, reconnectErr := reconnect.Connect(ctx, consumer)
+	connected, reconnectErr := reconnect.Connect(ctx, consumer)
 	if reconnectErr != nil {
 		report.Passed = false
 		report.Checks["optical_reconnect"] = reconnectErr.Error()
 	} else {
-		channel <- model.ThicknessSample{RunID: model.NewID(), Frequency: 10, Transmission: 0.9, Nanometers: 5, Valid: true, At: time.Now().UTC()}
+		connected.Channel <- model.ThicknessSample{RunID: model.NewID(), Seq: 1, Frequency: 10, Transmission: 0.9, Nanometers: 5, Valid: true, At: time.Now().UTC()}
 		_, observed := consumer.WaitForSample(20 * time.Millisecond)
-		report.Checks["optical_reconnect"] = fmt.Sprintf("observed=%t reconnects=%d", observed, consumer.ReconnectCount())
+		report.Checks["optical_reconnect"] = fmt.Sprintf("observed=%t reconnects=%d cursor=%d", observed, consumer.ReconnectCount(), connected.Cursor.LastSeq)
 	}
+
+	// Subscription protocol: dropped counters, last sequence and trace replay
+	// from a reconnect cursor. A size-1 subscriber is flooded; the broadcaster
+	// must count the drops without blocking the publisher, the trace must
+	// replay the gap by cursor, and replayed samples must never reach the
+	// safety monitor a second time.
+	subID, subCh, subStart := runtime.Broadcast.Subscribe(1)
+	runID := model.NewID()
+	for i := int64(1); i <= 4; i++ {
+		runtime.Capture(model.ThicknessSample{RunID: runID, Frequency: 10, Transmission: 0.9, Nanometers: float64(i), Valid: true, At: time.Now().UTC()}, 1)
+	}
+	// Drain whatever the size-1 buffer currently holds so Status reflects a
+	// settled subscriber, then read the counters.
+drainLoop:
+	for {
+		select {
+		case <-subCh:
+		default:
+			break drainLoop
+		}
+	}
+	subStatus, subKnown := runtime.Broadcast.Status(subID)
+	runtime.Broadcast.Unsubscribe(subID)
+	// Replay the gap from the cursor the subscription reports.
+	replayed := runtime.Traces.Replay(runID, subStatus.LastDelivered)
+	report.Checks["optical_subscription"] = fmt.Sprintf(
+		"known=%t start=%d last=%d dropped=%d replayed=%d trace_seq=%d",
+		subKnown, subStart.LastSeq, subStatus.LastSeq, subStatus.Dropped, len(replayed), runtime.Traces.LastSequence())
+	if !subKnown || subStatus.LastSeq != runtime.Traces.LastSequence() || subStatus.Dropped == 0 || len(replayed) == 0 {
+		report.Passed = false
+	}
+	// Consumer-side cursor replay: the monitor must observe live samples only.
+	gapMonitor := optical.NewMonitor()
+	gapConsumer := optical.NewConsumer(gapMonitor, make(chan model.ThicknessSample, 8))
+	gapStop := make(chan struct{})
+	go gapConsumer.Run(gapStop)
+	enqueued := gapConsumer.ReplayGap(runtime.Traces)
+	received := 0
+	gapDeadline := time.After(50 * time.Millisecond)
+gapLoop:
+	for received < enqueued {
+		select {
+		case <-gapConsumer.Gap():
+			received++
+		case <-gapDeadline:
+			break gapLoop
+		}
+	}
+	close(gapStop)
 	close(stop)
+	if !gapMonitor.Latest().At.IsZero() || received != enqueued || enqueued == 0 {
+		report.Passed = false
+		report.Checks["optical_gap_replay"] = fmt.Sprintf("enqueued=%d received=%d monitor_polluted=true skipped=%d", enqueued, received, gapConsumer.GapSkipped())
+	} else {
+		report.Checks["optical_gap_replay"] = fmt.Sprintf("enqueued=%d received=%d cursor=%d", enqueued, received, gapConsumer.Frontier())
+	}
 	carrier := substrate.NewCarrier()
 	carrierRun := model.NewID()
 	if err := carrier.Load("audit", carrierRun); err != nil {
